@@ -1,0 +1,16 @@
+# Web Framework & Server
+fastapi      
+uvicorn
+
+SQLAlchemy  
+
+pydantic      
+
+groq  
+scikit-learn
+pandas
+numpy
+
+razorpay
+httpx         
+python-dotenv
