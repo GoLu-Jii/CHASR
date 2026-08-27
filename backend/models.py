@@ -2,7 +2,7 @@
 
 import enum
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, JSON
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, JSON, Boolean
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -13,6 +13,7 @@ class InvoiceStatus(enum.Enum):
     partially_paid = "partially_paid"
     paid = "paid"
     written_off = "written_off"
+    escalation_exhausted = "escalation_exhausted"   # NEW — §9.4's terminal "handed to human" state
 
 class EscalationStage(enum.Enum):
     none = "none"
@@ -62,12 +63,12 @@ class Invoice(Base):
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(Integer, ForeignKey("customers.id"))
     amount = Column(Float, nullable=False)
+    amount_paid = Column(Float, default=0.0)   # NEW — nothing tracked actual receipt before this; §9.3 needs it
     due_date = Column(DateTime, nullable=False)
     issued_date = Column(DateTime, default=datetime.utcnow)
-    
-    # Links directly to the real test-mode Razorpay object
+
     razorpay_invoice_id = Column(String, unique=True, index=True, nullable=True)
-    
+
     status = Column(Enum(InvoiceStatus), default=InvoiceStatus.unpaid)
     current_stage = Column(Enum(EscalationStage), default=EscalationStage.none)
     last_contacted_at = Column(DateTime, nullable=True)
@@ -75,24 +76,23 @@ class Invoice(Base):
     customer = relationship("Customer", back_populates="invoices")
     ledger_entries = relationship("Ledger", back_populates="invoice")
     promises = relationship("Promise", back_populates="invoice")
+    needs_review = Column(Boolean, default=False)
 
 
 class Ledger(Base):
     """
-    The core audit trail. Append-only by construction. 
-    Never UPDATE or DELETE rows in this table.
+    The audit trail. Append-only by construction — engines/ledger.py is the
+    only code allowed to write here, via append_entry(). Never UPDATE/DELETE.
     """
     __tablename__ = "ledger"
 
     id = Column(Integer, primary_key=True, index=True)
     invoice_id = Column(Integer, ForeignKey("invoices.id"))
     event_type = Column(Enum(LedgerEventType), nullable=False)
-    
-    # Stores the raw API response, email text, or LLM extraction JSON
+
     payload = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    
-    # SHA-256 Chaining Fields
+
     prev_hash = Column(String, nullable=False)
     hash = Column(String, nullable=False, unique=True)
 
@@ -106,13 +106,12 @@ class Promise(Base):
     id = Column(Integer, primary_key=True, index=True)
     invoice_id = Column(Integer, ForeignKey("invoices.id"))
     ledger_entry_id = Column(Integer, ForeignKey("ledger.id"))
-    
+
     amount = Column(Float, nullable=True)
     promised_date = Column(DateTime, nullable=True)
     confidence = Column(Enum(PromiseConfidence), nullable=False)
     status = Column(Enum(PromiseStatus), default=PromiseStatus.pending)
-    
-    # The raw text the LLM parsed this from
+
     source_text = Column(String, nullable=False)
 
     invoice = relationship("Invoice", back_populates="promises")
@@ -120,23 +119,27 @@ class Promise(Base):
 
 
 class CustomerReliability(Base):
-
+    """
+    Note: surrogate `id` PK + non-unique customer_id means this is an
+    append-only HISTORY of scores, not one row per customer. Anywhere you
+    need a customer's current score, order by computed_at DESC and take the
+    latest row — reliability.py should own that query in one place.
+    """
     __tablename__ = "customer_reliability"
 
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(Integer, ForeignKey("customers.id"))
     computed_at = Column(DateTime, default=datetime.utcnow)
-    
+
     total_promises = Column(Integer, default=0)
     kept_full = Column(Integer, default=0)
     kept_partial = Column(Integer, default=0)
     broken = Column(Integer, default=0)
-    
+
     kept_full_rate = Column(Float, default=0.0)
     broken_rate = Column(Float, default=0.0)
     avg_days_late = Column(Float, default=0.0)
-    
-    # Output of the LogisticRegression model (0.0 to 1.0)
+
     score = Column(Float, default=0.0)
 
     customer = relationship("Customer", back_populates="reliability_scores")

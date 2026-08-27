@@ -1,122 +1,144 @@
 # backend/data/generate_synthetic.py
 
 import random
+import numpy as np
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-# Import the models we just built
-from backend.models import (
-    Base, Customer, Invoice, Ledger, Promise, CustomerReliability,
-    InvoiceStatus, EscalationStage, LedgerEventType, PromiseConfidence, PromiseStatus
-)
+from backend.database import SessionLocal, init_db
+from backend.models import Customer, Invoice, Promise, InvoiceStatus, EscalationStage, LedgerEventType, PromiseConfidence, PromiseStatus
+from backend.engines import ledger as ledger_engine
+from backend import config
 
-# Setup SQLite Database
-engine = create_engine("sqlite:///chasr.db")
-Base.metadata.create_all(engine)
-Session = sessionmaker(bind=engine)
-session = Session()
+# LOWERED from 0.4 to 0.15. If they fail the honesty roll, they break the promise.
+PARTIAL_INSTEAD_OF_BROKEN_PROB = 0.15
 
-# ==========================================
-# 1. The 5 Behavioral Archetypes
-# ==========================================
-ARCHETYPES = {
-    "Reliable": {"honesty": 0.9, "responsiveness": 0.9, "delay_days": 2, "tone": [PromiseConfidence.firm]},
-    "Slow-but-honest": {"honesty": 0.85, "responsiveness": 0.6, "delay_days": 15, "tone": [PromiseConfidence.firm, PromiseConfidence.soft]},
-    "Cash-strapped-genuine": {"honesty": 0.55, "responsiveness": 0.7, "delay_days": 25, "tone": [PromiseConfidence.soft, PromiseConfidence.vague]},
-    "Serial-slippery": {"honesty": 0.25, "responsiveness": 0.7, "delay_days": 40, "tone": [PromiseConfidence.firm]}, # High confidence, low honesty
-    "Ghost": {"honesty": 0.4, "responsiveness": 0.2, "delay_days": 60, "tone": [PromiseConfidence.vague]}
-}
+def determine_tone(base_honesty):
+    """
+    Determines the tone of the promise probabilistically based on base honesty.
+    Slippery customers fake high confidence; struggling ones sound vague.
+    """
+    if base_honesty > 0.8:
+        return random.choices([PromiseConfidence.firm, PromiseConfidence.soft], weights=[0.8, 0.2])[0]
+    elif base_honesty > 0.4:
+        return random.choices([PromiseConfidence.soft, PromiseConfidence.vague], weights=[0.6, 0.4])[0]
+    else:
+        # The serial slippery: low honesty, high confidence
+        return random.choices([PromiseConfidence.firm, PromiseConfidence.vague], weights=[0.7, 0.3])[0]
 
-# ==========================================
-# 2. Generator Functions
-# ==========================================
-
-def generate_customers_and_history(num_customers=50):
-    print(f"Generating {num_customers} synthetic customers...")
-    
-    archetype_keys = list(ARCHETYPES.keys())
+def generate_customers_and_history(session, num_customers=1000):
+    print(f"Generating {num_customers} unique synthetic customers using continuous distributions...")
     
     for i in range(num_customers):
-        # Assign a hidden archetype (not saved to DB, only used for data generation)
-        archetype_name = random.choice(archetype_keys)
-        behavior = ARCHETYPES[archetype_name]
+        # Continuous Variance: Every customer gets a unique profile
+        base_honesty = float(np.clip(np.random.normal(loc=0.65, scale=0.25), 0.1, 0.99))
+        base_responsiveness = float(np.clip(np.random.normal(loc=0.60, scale=0.30), 0.1, 0.99))
         
+        base_delay_days = int(np.random.gamma(shape=2.0, scale=10.0))
+        base_delay_days = max(1, min(base_delay_days, 90))
+        
+        behavior = {
+            "honesty": base_honesty,
+            "responsiveness": base_responsiveness,
+            "delay_days": base_delay_days
+        }
+
+        tenure_days = random.randint(400, 700)
+        created_at = datetime.utcnow() - timedelta(days=tenure_days)
+
         customer = Customer(
-            name=f"Customer {i+1} ({archetype_name})", # Name includes archetype just for your easy debugging
+            name=f"Customer {i+1}", 
             email=f"accounts@company{i+1}.com",
-            phone=f"+9198765{random.randint(10000, 99999)}"
+            phone=f"+9198765{random.randint(10000, 99999)}",
+            created_at=created_at,
         )
         session.add(customer)
         session.commit()
         
-        # Generate 5-10 historical invoices per customer
-        generate_invoices_for_customer(customer, behavior)
+        # 15-25 invoices per customer to cure the cold-start penalty
+        generate_invoices_for_customer(session, customer, behavior, tenure_days)
 
-def generate_invoices_for_customer(customer, behavior):
-    num_invoices = random.randint(5, 10)
-    
+def generate_invoices_for_customer(session, customer, behavior, tenure_days):
+    num_invoices = random.randint(15, 25)
+
     for _ in range(num_invoices):
-        amount = round(random.uniform(10000, 500000), 2)
-        # Random past date between 1 year ago and 1 month ago
-        days_ago = random.randint(30, 365)
+        days_ago = random.randint(30, tenure_days - 30)
         issued_date = datetime.utcnow() - timedelta(days=days_ago)
-        due_date = issued_date + timedelta(days=30) # Net-30 terms
-        
+
         invoice = Invoice(
             customer_id=customer.id,
-            amount=amount,
-            due_date=due_date,
+            amount=round(random.uniform(10000, 500000), 2),
+            amount_paid=0.0,
+            due_date=issued_date + timedelta(days=30),
             issued_date=issued_date,
-            status=InvoiceStatus.unpaid # We start unpaid, and simulate history
+            status=InvoiceStatus.unpaid,
         )
         session.add(invoice)
         session.commit()
-        
-        # Simulate the invoice's lifecycle based on customer archetype
-        simulate_invoice_lifecycle(invoice, behavior)
 
-def simulate_invoice_lifecycle(invoice, behavior):
-    # Base ledger entry for invoice creation
-    ledger_create = Ledger(
-        invoice_id=invoice.id,
-        event_type=LedgerEventType.invoice_created,
-        payload={"msg": "Invoice generated via Razorpay"},
-        prev_hash="0" * 64, # Genesis hash
-        hash=f"mock_hash_{random.randint(1000, 9999)}" # Mocking hash for generator script
-    )
-    session.add(ledger_create)
-    session.commit()
-    
-    # Check if they reply to escalations (Responsiveness)
-    if random.random() < behavior["responsiveness"]:
-        tone = random.choice(behavior["tone"])
-        promised_date = invoice.due_date + timedelta(days=behavior["delay_days"])
-        
-        # Determine actual outcome based strictly on HONESTY, not TONE
-        # This is the golden rule from the architecture doc.
-        is_kept = random.random() < behavior["honesty"]
-        
-        if is_kept:
-            final_status = PromiseStatus.kept_full
-            invoice.status = InvoiceStatus.paid
-        else:
-            final_status = PromiseStatus.broken
-            invoice.status = InvoiceStatus.unpaid
-            invoice.current_stage = EscalationStage.formal
-            
-        promise = Promise(
-            invoice_id=invoice.id,
-            ledger_entry_id=ledger_create.id,
-            amount=invoice.amount,
-            promised_date=promised_date,
-            confidence=tone,
-            status=final_status,
-            source_text="Simulated email reply placeholder"
+        ledger_engine.append_entry(
+            session, invoice.id, LedgerEventType.invoice_created,
+            {"msg": "Invoice generated via Razorpay (test mode)"},
         )
-        session.add(promise)
-        session.commit()
+        simulate_invoice_lifecycle(session, invoice, behavior)
+
+def simulate_invoice_lifecycle(session, invoice, behavior):
+    if random.random() >= behavior["responsiveness"]:
+        return
+
+    escalation_entry = ledger_engine.append_entry(
+        session, invoice.id, LedgerEventType.escalation_sent,
+        {"stage": "nudge", "channel": "WhatsApp (Simulated)", "note": "synthetic historical escalation"},
+    )
+
+    tone = determine_tone(behavior["honesty"])
+    
+    delay_variance = random.randint(-5, 5)
+    actual_delay = max(1, behavior["delay_days"] + delay_variance)
+    promised_date = invoice.due_date + timedelta(days=actual_delay)
+
+    # Invoice-Level Shock: Add variance to the specific transaction
+    shock_factor = np.random.choice([1.0, 0.5, 0.2], p=[0.85, 0.10, 0.05])
+    actual_honesty = behavior["honesty"] * shock_factor
+
+    outcome_roll = random.random()
+    if outcome_roll < actual_honesty:
+        final_status, pct = PromiseStatus.kept_full, random.uniform(config.KEPT_MIN_PCT, 1.0)
+    elif outcome_roll < actual_honesty + (1 - actual_honesty) * PARTIAL_INSTEAD_OF_BROKEN_PROB:
+        final_status, pct = PromiseStatus.kept_partial, random.uniform(config.PARTIAL_MIN_PCT, config.KEPT_MIN_PCT - 0.01)
+    else:
+        final_status, pct = PromiseStatus.broken, random.uniform(0.0, config.PARTIAL_MIN_PCT - 0.01)
+
+    invoice.amount_paid = round(invoice.amount * pct, 2)
+    if final_status == PromiseStatus.kept_full:
+        invoice.status = InvoiceStatus.paid
+    elif final_status == PromiseStatus.kept_partial:
+        invoice.status = InvoiceStatus.partially_paid
+    else:
+        invoice.status = InvoiceStatus.written_off
+        invoice.current_stage = EscalationStage.formal
+    session.commit()
+
+    promise = Promise(
+        invoice_id=invoice.id, ledger_entry_id=escalation_entry.id,
+        amount=invoice.amount, promised_date=promised_date,
+        confidence=tone, status=final_status,
+        source_text="Simulated reply placeholder — real text arrives once promise_extraction.py exists",
+    )
+    session.add(promise)
+    session.commit()
+
+    ledger_engine.append_entry(
+        session, invoice.id, LedgerEventType.promise_status_updated,
+        {"status": final_status.value, "promised_date": promised_date.isoformat()},
+    )
+    if invoice.amount_paid > 0:
+        ledger_engine.append_entry(session, invoice.id, LedgerEventType.payment_received, {"amount": invoice.amount_paid})
 
 if __name__ == "__main__":
-    generate_customers_and_history(50)
-    print("Database populated successfully. Synthetic baseline established.")
+    init_db()
+    session = SessionLocal()
+    try:
+        generate_customers_and_history(session, num_customers=1000)
+        print("Database populated successfully. Synthetic baseline established with continuous distributions.")
+    finally:
+        session.close()
