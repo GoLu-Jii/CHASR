@@ -96,19 +96,22 @@ def simulate_invoice_lifecycle(session, invoice, behavior):
     actual_delay = max(1, behavior["delay_days"] + delay_variance)
     promised_date = invoice.due_date + timedelta(days=actual_delay)
 
-    # Invoice-Level Shock: Add variance to the specific transaction
-    shock_factor = np.random.choice([1.0, 0.5, 0.2], p=[0.85, 0.10, 0.05])
-    actual_honesty = behavior["honesty"] * shock_factor
-
     outcome_roll = random.random()
-    if outcome_roll < actual_honesty:
-        final_status, pct = PromiseStatus.kept_full, random.uniform(config.KEPT_MIN_PCT, 1.0)
-    elif outcome_roll < actual_honesty + (1 - actual_honesty) * PARTIAL_INSTEAD_OF_BROKEN_PROB:
-        final_status, pct = PromiseStatus.kept_partial, random.uniform(config.PARTIAL_MIN_PCT, config.KEPT_MIN_PCT - 0.01)
+    if outcome_roll < behavior["honesty"]:
+        payment_amount = invoice.amount * random.uniform(0.95, 1.0)
+    elif outcome_roll < behavior["honesty"] + (1 - behavior["honesty"]) * PARTIAL_INSTEAD_OF_BROKEN_PROB:
+        payment_amount = invoice.amount * random.uniform(0.30, 0.94)
     else:
-        final_status, pct = PromiseStatus.broken, random.uniform(0.0, config.PARTIAL_MIN_PCT - 0.01)
+        payment_amount = invoice.amount * random.uniform(0.0, 0.29)
 
-    invoice.amount_paid = round(invoice.amount * pct, 2)
+    invoice.amount_paid = round(payment_amount, 2)
+    payment_ratio = invoice.amount_paid / invoice.amount
+    if payment_ratio >= config.KEPT_MIN_PCT:
+        final_status = PromiseStatus.kept_full
+    elif payment_ratio >= config.PARTIAL_MIN_PCT:
+        final_status = PromiseStatus.kept_partial
+    else:
+        final_status = PromiseStatus.broken
     if final_status == PromiseStatus.kept_full:
         invoice.status = InvoiceStatus.paid
     elif final_status == PromiseStatus.kept_partial:
@@ -127,6 +130,18 @@ def simulate_invoice_lifecycle(session, invoice, behavior):
     session.add(promise)
     session.commit()
 
+    ledger_engine.append_entry(
+        session, invoice.id, LedgerEventType.reply_received,
+        {"text": "Synthetic historical reply"},
+    )
+    ledger_engine.append_entry(
+        session, invoice.id, LedgerEventType.promise_extracted,
+        {
+            "amount": invoice.amount,
+            "promised_date": promised_date.isoformat(),
+            "confidence": tone.value,
+        },
+    )
     ledger_engine.append_entry(
         session, invoice.id, LedgerEventType.promise_status_updated,
         {"status": final_status.value, "promised_date": promised_date.isoformat()},

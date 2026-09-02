@@ -20,13 +20,16 @@ _TERMINAL_STATUSES = {InvoiceStatus.paid, InvoiceStatus.written_off, InvoiceStat
 
 
 def evaluate_and_escalate(session: Session, invoice_id: int):
-    invoice = session.query(Invoice).filter(Invoice.id == invoice_id).first()
+    invoice = session.query(Invoice).filter(
+        Invoice.id == invoice_id,
+        Invoice.status.in_([InvoiceStatus.unpaid, InvoiceStatus.partially_paid]),
+    ).first()
+
+    if not invoice or invoice.status in _TERMINAL_STATUSES:
+        return
 
     if invoice.needs_review:
         return
-
-    if not invoice or invoice.status in _TERMINAL_STATUSES:
-        return  # STOPPING RULE 1 — note partially_paid is NOT terminal, it keeps getting chased
 
     active_promise = (
         session.query(Promise)
@@ -67,10 +70,23 @@ def evaluate_and_escalate(session: Session, invoice_id: int):
         return  # inside or past the window — either way, don't re-send formal on repeat
 
     target_stage = EscalationStage.nudge
-    if days_overdue > config.FIRM_AFTER_DAYS:
-        target_stage = EscalationStage.firm
-    if days_overdue > config.FORMAL_AFTER_DAYS:
+    has_broken_promise = session.query(Promise).filter(
+        Promise.invoice_id == invoice_id,
+        Promise.status == PromiseStatus.broken,
+    ).first() is not None
+    if has_broken_promise or days_overdue > config.FORMAL_AFTER_DAYS:
         target_stage = EscalationStage.formal
+    elif days_overdue > config.FIRM_AFTER_DAYS:
+        target_stage = EscalationStage.firm
+
+    severity = {
+        EscalationStage.none: 0,
+        EscalationStage.nudge: 1,
+        EscalationStage.firm: 2,
+        EscalationStage.formal: 3,
+    }
+    if severity[target_stage] < severity[invoice.current_stage]:
+        target_stage = invoice.current_stage
 
     if target_stage == invoice.current_stage:
         return  # already sent this stage — this is what stops the daily-resend bug
