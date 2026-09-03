@@ -7,8 +7,8 @@ load_dotenv()
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./chasr.db")
 
 # §9.3 — kept / partial / broken thresholds

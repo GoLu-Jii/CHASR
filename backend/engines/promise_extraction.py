@@ -3,9 +3,11 @@
 import json
 from datetime import datetime
 
+from fastapi import HTTPException
 from groq import Groq
 
 from backend import config
+from backend.clock import now
 from backend.engines import ledger as ledger_engine
 from backend.models import Invoice, LedgerEventType, Promise, PromiseConfidence, PromiseStatus
 
@@ -13,80 +15,88 @@ from backend.models import Invoice, LedgerEventType, Promise, PromiseConfidence,
 def get_groq_client():
     if not config.GROQ_API_KEY:
         return None
-    return Groq(api_key=config.GROQ_API_KEY)
+    # Groq's SDK appends /openai/v1 itself; keep the base at the API host.
+    return Groq(api_key=config.GROQ_API_KEY, base_url="https://api.groq.com")
 
-# Groq uses the OpenAI tool-calling format (type, function, parameters)
-EXTRACT_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "extract_promise",
-        "description": "Extract structured payment commitments from a customer's reply about an overdue invoice. Never invent an amount or date that wasn't actually stated.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "has_commitment": {"type": "boolean"},
-                "commitments": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "amount": {"type": ["number", "null"]},
-                            "promised_date": {"type": ["string", "null"], "description": "ISO date (YYYY-MM-DD), or null if none was actually stated"},
-                            "confidence": {"type": "string", "enum": ["firm", "soft", "vague"]}
-                        },
-                        "required": ["confidence"]
-                    }
-                }
-            },
-            "required": ["has_commitment", "commitments"]
-        }
-    }
-}
-
-def extract_promise(session, invoice_id: int, reply_text: str) -> list[Promise]:
-    if not config.GROQ_API_KEY or session is None:
+def extract_promise(
+    session,
+    invoice_id: int,
+    reply_text: str,
+    invoice_amount: float = 0.0,
+) -> list[Promise]:
+    if session is None:
         return []
 
     reply_entry = ledger_engine.append_entry(
         session, invoice_id, LedgerEventType.reply_received, {"text": reply_text}
     )
+    if not config.GROQ_API_KEY:
+        session.commit()
+        raise HTTPException(status_code=429, detail="LLM API Error: GROQ_API_KEY is not configured")
 
     try:
         client = get_groq_client()
         if not client:
             return []
 
+        current_date = now().date().isoformat()
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[{
-                "role": "user",
-                "content": f'Today\'s date: {datetime.utcnow().date().isoformat()}\nCustomer reply regarding an overdue invoice:\n"{reply_text}"'
-            }],
-            tools=[EXTRACT_TOOL],
-            tool_choice={"type": "function", "function": {"name": "extract_promise"}},
+            model=config.GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"The total invoice amount is {invoice_amount}. "
+                        f"Today's reference date is {current_date}. "
+                        "Extract payment commitments from the customer reply. "
+                        "Resolve percentages and relative amounts. Resolve every "
+                        "relative date to strict YYYY-MM-DD. Return only one valid JSON "
+                        "matching this schema: {\"has_commitment\": boolean, "
+                        "\"commitments\": [{\"amount\": number or null, "
+                        "\"promised_date\": string or null, \"confidence\": "
+                        "\"firm\"|\"soft\"|\"vague\"}]}."
+                    ),
+                },
+                {"role": "user", "content": reply_text},
+            ],
             temperature=0,
-            max_tokens=512,
+            max_tokens=2048,
         )
 
-        tool_calls = getattr(response.choices[0].message, "tool_calls", None) or []
-        if not tool_calls:
-            return []
-
-        result = json.loads(tool_calls[0].function.arguments)
-    except Exception:
-        return []
+        try:
+            raw_content = response.choices[0].message.content or ""
+            cleaned_content = raw_content.replace("```json", "").replace("```", "").strip()
+            result = json.loads(cleaned_content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result = {"has_commitment": False, "commitments": []}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=f"LLM API Error: {exc}",
+        ) from exc
 
     ledger_engine.append_entry(session, invoice_id, LedgerEventType.promise_extracted, {"raw": result})
 
     created = []
     for c in result.get("commitments", []):
-        has_concrete_date = bool(c.get("promised_date"))
+        promised_date = None
+        promised_date_value = c.get("promised_date")
+        if promised_date_value:
+            try:
+                promised_date = datetime.strptime(
+                    promised_date_value,
+                    "%Y-%m-%d",
+                )
+            except (TypeError, ValueError):
+                promised_date = None
+
+        has_concrete_date = promised_date is not None
 
         promise = Promise(
             invoice_id=invoice_id,
             ledger_entry_id=reply_entry.id,
             amount=c.get("amount"),
-            promised_date=datetime.fromisoformat(c["promised_date"]) if has_concrete_date else None,
+            promised_date=promised_date,
             confidence=PromiseConfidence(c["confidence"]),
             status=PromiseStatus.pending,
             source_text=reply_text,

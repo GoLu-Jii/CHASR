@@ -3,6 +3,7 @@
 from datetime import datetime
 from sqlalchemy.orm import Session
 
+from backend.clock import now
 from backend.models import (
     Invoice, InvoiceStatus, EscalationStage,
     Promise, PromiseStatus, Ledger, LedgerEventType,
@@ -39,7 +40,11 @@ def evaluate_and_escalate(session: Session, invoice_id: int):
     )
 
     if active_promise:
-        if active_promise.promised_date >= datetime.utcnow():
+        if active_promise.promised_date is None:
+            invoice.needs_review = True
+            session.commit()
+            return
+        if active_promise.promised_date >= now():
             return  # STOPPING RULE 2 — inside the agreed grace period
 
         # Broken promise — fast-track to formal and stop HERE. Do not fall
@@ -50,7 +55,7 @@ def evaluate_and_escalate(session: Session, invoice_id: int):
         _execute_escalation(session, invoice, EscalationStage.formal)
         return
 
-    days_overdue = (datetime.utcnow() - invoice.due_date).days
+    days_overdue = (now() - invoice.due_date).days
     if days_overdue <= config.NUDGE_AFTER_DAYS:
         return
 
@@ -64,7 +69,7 @@ def evaluate_and_escalate(session: Session, invoice_id: int):
         return
 
     if invoice.current_stage == EscalationStage.formal and invoice.last_contacted_at:
-        silence_days = (datetime.utcnow() - invoice.last_contacted_at).days
+        silence_days = (now() - invoice.last_contacted_at).days
         if silence_days >= config.OBSERVATION_WINDOW_DAYS:
             _exhaust(session, invoice, reason=f"No response {silence_days} days after formal notice.")
         return  # inside or past the window — either way, don't re-send formal on repeat
@@ -110,7 +115,7 @@ def _execute_escalation(session: Session, invoice: Invoice, stage: EscalationSta
     )
 
     invoice.current_stage = stage
-    invoice.last_contacted_at = datetime.utcnow()
+    invoice.last_contacted_at = now()
     session.commit()
 
     ledger_engine.append_entry(

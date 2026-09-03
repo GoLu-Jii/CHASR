@@ -6,7 +6,7 @@ SQLAlchemy
 
 pydantic      
 
-groq  
+groq
 scikit-learn
 pandas
 numpy
