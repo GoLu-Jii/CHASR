@@ -17,10 +17,18 @@ KEPT_GRACE_DAYS = 2
 PARTIAL_MIN_PCT = 0.30
 PARTIAL_GRACE_DAYS = 7
 
-# Escalation ladder cutoffs (days overdue) — placeholder until reliability.py replaces this
+# Escalation ladder cutoffs (days overdue).  The engine adjusts these within the
+# bounded low/high-reliability windows below; it never asks an LLM to decide.
 NUDGE_AFTER_DAYS = 0
 FIRM_AFTER_DAYS = 15
 FORMAL_AFTER_DAYS = 30
+LOW_RELIABILITY_THRESHOLD = 0.40
+HIGH_RELIABILITY_THRESHOLD = 0.75
+LOW_RELIABILITY_FIRM_AFTER_DAYS = 7
+LOW_RELIABILITY_FORMAL_AFTER_DAYS = 21
+HIGH_RELIABILITY_FIRM_AFTER_DAYS = 20
+HIGH_RELIABILITY_FORMAL_AFTER_DAYS = 35
+RECONTACT_INTERVAL_DAYS = 7
 
 # §9.4 — stopping rule
 OBSERVATION_WINDOW_DAYS = 10

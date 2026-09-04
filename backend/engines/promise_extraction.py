@@ -75,10 +75,26 @@ def extract_promise(
             detail=f"LLM API Error: {exc}",
         ) from exc
 
+    if not isinstance(result, dict):
+        result = {"has_commitment": False, "commitments": []}
+    commitments = result.get("commitments")
+    if not isinstance(commitments, list):
+        commitments = []
+    # Preserve the model output in the audit record, while accepting only the
+    # narrow structure the rest of the system understands.
+    result = {"has_commitment": bool(result.get("has_commitment")), "commitments": commitments}
     ledger_engine.append_entry(session, invoice_id, LedgerEventType.promise_extracted, {"raw": result})
 
     created = []
-    for c in result.get("commitments", []):
+    for c in commitments:
+        if not isinstance(c, dict):
+            continue
+        confidence_value = c.get("confidence", "vague")
+        if confidence_value not in {item.value for item in PromiseConfidence}:
+            confidence_value = "vague"
+        amount = c.get("amount")
+        if not isinstance(amount, (int, float)) or amount <= 0 or amount > invoice_amount:
+            amount = None
         promised_date = None
         promised_date_value = c.get("promised_date")
         if promised_date_value:
@@ -95,9 +111,9 @@ def extract_promise(
         promise = Promise(
             invoice_id=invoice_id,
             ledger_entry_id=reply_entry.id,
-            amount=c.get("amount"),
+            amount=amount,
             promised_date=promised_date,
-            confidence=PromiseConfidence(c["confidence"]),
+            confidence=PromiseConfidence(confidence_value),
             status=PromiseStatus.pending,
             source_text=reply_text,
         )

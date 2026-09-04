@@ -3,8 +3,9 @@
 from datetime import datetime, timedelta
 
 from backend.database import SessionLocal, init_db
+from backend.clock import now
 from backend.engines import ledger as ledger_engine
-from backend.models import Customer, EscalationStage, Invoice, InvoiceStatus, Ledger, LedgerEventType, Promise
+from backend.models import Customer, EscalationStage, Invoice, InvoiceStatus, Ledger, LedgerEventType, Promise, PromiseConfidence, PromiseStatus
 
 MANUAL_DEMO_RECORDS = [
     # --- THE 3 "GOLDEN" DEMO SCENARIOS ---
@@ -229,6 +230,9 @@ MANUAL_DEMO_RECORDS = [
 
 def seed_manual_demo():
     init_db()
+    # Read virtual time before opening the seed transaction. Calling clock.now()
+    # inside it opens a second SQLite writer and can lock Demo Reset.
+    reference_time = now()
     session = SessionLocal()
 
     try:
@@ -267,7 +271,7 @@ def seed_manual_demo():
                 customer.phone = record["phone"]
                 customer.email = record["email"]
 
-            due_date = datetime.utcnow() - timedelta(days=record["days_overdue"])
+            due_date = reference_time - timedelta(days=record["days_overdue"])
             issued_date = due_date - timedelta(days=30)
 
             invoice = Invoice(customer_id=record["customer_id"])
@@ -308,10 +312,48 @@ def seed_manual_demo():
                 },
             )
 
+        # Give the two primary recording scenarios genuine, persisted history:
+        # Northstar keeps promises; BluePeak breaks them. These are separate
+        # closed invoices, so the live demo invoice remains untouched while
+        # score_customer() derives visibly different scores from real rows.
+        _seed_reliability_history(session, 10001, kept=True, reference=reference_time)
+        _seed_reliability_history(session, 10002, kept=False, reference=reference_time)
+
         session.commit()
         print(f"Seeded {len(MANUAL_DEMO_RECORDS)} uniquely varied demo invoices successfully.")
     finally:
         session.close()
+
+
+def _seed_reliability_history(session, customer_id: int, kept: bool, reference: datetime) -> None:
+    for index in range(4):
+        due_date = reference - timedelta(days=120 + index * 10)
+        historical = Invoice(
+            customer_id=customer_id,
+            amount=100000.0,
+            amount_paid=100000.0 if kept else 0.0,
+            due_date=due_date,
+            issued_date=due_date - timedelta(days=30),
+            status=InvoiceStatus.paid if kept else InvoiceStatus.written_off,
+            current_stage=EscalationStage.none if kept else EscalationStage.formal,
+        )
+        session.add(historical)
+        session.flush()
+        ledger_engine.append_entry(session, historical.id, LedgerEventType.invoice_created, {"source": "demo_reliability_history"})
+        escalation_entry = ledger_engine.append_entry(session, historical.id, LedgerEventType.escalation_sent, {"stage": "nudge", "source": "demo_reliability_history"})
+        ledger_engine.append_entry(session, historical.id, LedgerEventType.reply_received, {"text": "Synthetic historical commitment"})
+        promise = Promise(
+            invoice_id=historical.id,
+            ledger_entry_id=escalation_entry.id,
+            amount=historical.amount,
+            promised_date=due_date + timedelta(days=3),
+            confidence=PromiseConfidence.firm,
+            status=PromiseStatus.kept_full if kept else PromiseStatus.broken,
+            source_text="Seeded historical promise for the repeatable demo.",
+        )
+        session.add(promise)
+        session.commit()
+        ledger_engine.append_entry(session, historical.id, LedgerEventType.promise_status_updated, {"status": promise.status.value})
 
 if __name__ == "__main__":
     seed_manual_demo()

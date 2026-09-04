@@ -30,7 +30,7 @@ Show: `/dashboard` with a handful of overdue invoices at different stages.
 
 > "Razorpay's own Agent Studio page lists seven shipped agents — and separately names 'following up on unpaid invoices until they're paid' as something it hasn't built yet. Smart Collect only reconciles money that's already arrived. This runs before that, on Razorpay's real rails."
 
-Show: a Razorpay Invoice or Payment Link you actually created via the API, then flip to the Razorpay test dashboard to prove it's real, not mocked.
+Show: open any invoice detail page, click **Create Razorpay test link**, and show the returned provider IDs and payment link in the Razorpay test-mode panel. The success message must say **Live Razorpay test object created**, not **Mock fallback**. Open the payment link in another tab if desired, then flip to the Razorpay test dashboard and search for the invoice ID or payment-link ID to prove it was created through the API.
 
 ## 1:15 – 2:15 — Live extraction (AI judgment)
 
@@ -58,9 +58,9 @@ Saying this unprompted is stronger than getting caught by it live.
 
 ## 3:40 – 4:30 — Batch results vs. baseline (the track's actual bar)
 
-Go to `/results`. State the real numbers from your actual run — recovered amount, precision/recall, and the comparison against the dumb fixed-schedule baseline.
+Go to `/results`. State the real numbers from your actual run — recovered amount, precision/recall, and the targeting comparison against the dumb fixed-schedule baseline.
 
-> "On the same 50 invoices, the reliability-driven approach recovered [X]% more than a flat every-5-days reminder — and here's the exception list it flagged honestly instead of hiding."
+> "On the same 50 invoices, CHASR recovered [observed amount] in the held-out batch, with [precision] precision and [recall] recall. The adaptive and fixed-schedule target sets are shown side by side; this dataset has no counterfactual payment outcomes, so we don't invent a recovery uplift — and here's the exception list it flagged honestly instead of hiding."
 
 Fill in `[X]` only with what your own batch run actually produced.
 

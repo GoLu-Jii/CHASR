@@ -72,11 +72,13 @@ class Invoice(Base):
     status = Column(Enum(InvoiceStatus), default=InvoiceStatus.unpaid)
     current_stage = Column(Enum(EscalationStage), default=EscalationStage.none)
     last_contacted_at = Column(DateTime, nullable=True)
+    contact_count = Column(Integer, default=0, nullable=False)
 
     customer = relationship("Customer", back_populates="invoices")
     ledger_entries = relationship("Ledger", back_populates="invoice")
     promises = relationship("Promise", back_populates="invoice")
     needs_review = Column(Boolean, default=False)
+    razorpay_payment_link_id = Column(String, unique=True, index=True, nullable=True)
 
 
 class Ledger(Base):

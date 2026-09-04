@@ -33,7 +33,12 @@ def create_invoice(invoice_record: Invoice) -> dict:
 
     customer = invoice_record.customer
     amount_in_paise = int(float(invoice_record.amount) * 100)
-    due_date_ts = int(time.mktime(invoice_record.due_date.timetuple()))
+    # Demo invoices are already overdue; Razorpay still requires a future
+    # expiry for a new test-mode invoice.
+    due_date_ts = max(
+        int(time.time()) + 24 * 60 * 60,
+        int(time.mktime(invoice_record.due_date.timetuple())),
+    )
 
     payload = {
         "type": "invoice",
@@ -68,7 +73,6 @@ def create_payment_link(invoice_record: Invoice) -> dict:
     client = get_client()
     if client is None:
         return _mock_response(invoice_record, kind="link")
-
     try:
         payload = {
             "amount": int(float(invoice_record.amount) * 100),
@@ -88,6 +92,25 @@ def create_payment_link(invoice_record: Invoice) -> dict:
     except Exception as exc:  # pragma: no cover
         print(f"Razorpay payment link creation failed: {exc}")
         return _mock_response(invoice_record, kind="link")
+
+
+def fetch_payment_link(payment_link_id: str) -> dict:
+    """Fetch a Razorpay payment-link state without leaking SDK calls elsewhere."""
+    if not payment_link_id or "mock" in payment_link_id:
+        return {"status": "created", "amount_paid": 0.0, "mocked": True}
+    client = get_client()
+    if client is None:
+        return {"status": "created", "amount_paid": 0.0, "mocked": True}
+    try:
+        link = client.payment_link.fetch(payment_link_id)
+        return {
+            "status": link.get("status", "created"),
+            "amount_paid": float(link.get("amount_paid", 0)) / 100.0,
+            "mocked": False,
+        }
+    except Exception as exc:  # pragma: no cover - network/runtime guard
+        print(f"Razorpay payment-link fetch failed: {exc}")
+        return {"status": "unknown", "amount_paid": 0.0, "error": str(exc)}
 
 
 def create_real_invoice(invoice_record: Invoice) -> dict:

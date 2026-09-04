@@ -5,16 +5,19 @@ from datetime import datetime, timedelta
 import joblib
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from backend import config
 from backend.clock import advance as advance_demo_clock, now as demo_now, reset as reset_demo_clock
 from backend.database import get_db, init_db
-from backend.engines import escalation, ledger, promise_extraction, reliability
-from backend.models import Customer, Invoice, InvoiceStatus, Ledger, Promise
+from backend.engines import escalation, ledger, payments, promise_extraction, reliability
+from backend.integrations import razorpay_client
+from backend.ml.evaluate import run_batch_evaluation
+from backend.models import Customer, CustomerReliability, Invoice, InvoiceStatus, Ledger, Promise
 
 ml_model = None
 
@@ -66,37 +69,22 @@ class AdvanceClockPayload(BaseModel):
     days: int
 
 
+class PaymentPayload(BaseModel):
+    amount_paid: float | None = None
+
+
 def ensure_demo_data():
     from backend.database import SessionLocal
 
     db = SessionLocal()
     try:
-        invoice_count = db.query(Invoice).count()
-        if invoice_count > 0:
+        demo_count = db.query(Invoice).filter(Invoice.customer_id >= 10000).count()
+        if demo_count > 0:
             return
-
-        customer_a = Customer(name="Northwind Steel", gstin="29ABCDE1234F1Z5", phone="9999999999", email="ops@northwind.test")
-        customer_b = Customer(name="Crest Logistics", gstin="27FGHIJ5678K2L9", phone="9888888888", email="finance@crest.test")
-        customer_c = Customer(name="Mitra Retail", gstin="19LMNOP9012Q3R4", phone="9777777777", email="ap@mitra.test")
-        db.add_all([customer_a, customer_b, customer_c])
-        db.flush()
-
-        invoices = [
-            Invoice(customer_id=customer_a.id, amount=185000.0, due_date=datetime.utcnow() - timedelta(days=18), issued_date=datetime.utcnow() - timedelta(days=35), status=InvoiceStatus.unpaid, current_stage="nudge"),
-            Invoice(customer_id=customer_b.id, amount=92000.0, due_date=datetime.utcnow() - timedelta(days=42), issued_date=datetime.utcnow() - timedelta(days=68), status=InvoiceStatus.partially_paid, current_stage="firm"),
-            Invoice(customer_id=customer_c.id, amount=240000.0, due_date=datetime.utcnow() - timedelta(days=61), issued_date=datetime.utcnow() - timedelta(days=91), status=InvoiceStatus.unpaid, current_stage="formal"),
-            Invoice(customer_id=customer_a.id, amount=67000.0, due_date=datetime.utcnow() - timedelta(days=4), issued_date=datetime.utcnow() - timedelta(days=20), status=InvoiceStatus.unpaid, current_stage="none"),
-            Invoice(customer_id=customer_b.id, amount=54000.0, due_date=datetime.utcnow() - timedelta(days=9), issued_date=datetime.utcnow() - timedelta(days=29), status=InvoiceStatus.unpaid, current_stage="none"),
-        ]
-        db.add_all(invoices)
-        db.flush()
-
-        for inv in invoices:
-            ledger.append_entry(db, inv.id, "invoice_created", {"amount": inv.amount, "customer_id": inv.customer_id})
-            if inv.amount > 100000:
-                ledger.append_entry(db, inv.id, "escalation_sent", {"stage": inv.current_stage.value if inv.current_stage else "nudge", "message_sent": "Demo reminder generated"})
     finally:
         db.close()
+    # Keep synthetic history intact; seed only the deterministic demo slice.
+    _seed_demo_data()
 
 
 @app.get("/api/health")
@@ -184,6 +172,19 @@ def get_invoice_detail(invoice_id: int, db: Session = Depends(get_db)):
         "reliability_score": reliability.score_customer(invoice.customer_id, db),
         "next_action": _next_action(invoice),
         "next_message": _next_message(invoice),
+        "razorpay_invoice_id": invoice.razorpay_invoice_id,
+        "razorpay_payment_link_id": invoice.razorpay_payment_link_id,
+        "promises": [
+            {
+                "id": promise.id,
+                "amount": promise.amount,
+                "promised_date": promise.promised_date.isoformat() if promise.promised_date else None,
+                "confidence": promise.confidence.value,
+                "status": promise.status.value,
+                "source_text": promise.source_text,
+            }
+            for promise in invoice.promises
+        ],
     }
 
 
@@ -243,7 +244,7 @@ def _next_message(invoice: Invoice) -> str | None:
     if pending_promise and pending_promise.amount is not None and pending_promise.promised_date:
         return (
             "Automation paused until "
-            f"{pending_promise.promised_date.strftime('%Y-%m-%d')}. "
+            f"{pending_promise.promised_date.strftime('%d %b %Y')}. "
             "CHASR will evaluate payment against this promise."
         )
 
@@ -261,7 +262,7 @@ def _next_message(invoice: Invoice) -> str | None:
         name=invoice.customer.name if invoice.customer else "Customer",
         inv_id=invoice.id,
         amount=invoice.amount,
-        date=invoice.due_date.strftime("%Y-%m-%d"),
+        date=invoice.due_date.strftime("%d %b %Y"),
         link=f"https://rzp.io/test_{invoice.id}",
     )
 
@@ -294,21 +295,28 @@ def verify_invoice_ledger(invoice_id: int, db: Session = Depends(get_db)):
     return {"invoice_id": invoice_id, "chain_integrity_valid": ledger.verify_chain(db, invoice_id)}
 
 
-@app.get("/api/results")
-def get_results_summary(db: Session = Depends(get_db)):
-    recovered = db.query(func.sum(Invoice.amount_paid)).scalar() or 0
-    unpaid = db.query(func.sum(Invoice.amount)).filter(Invoice.status.in_([InvoiceStatus.unpaid, InvoiceStatus.partially_paid])).scalar() or 0
+@app.post("/api/invoices/{invoice_id}/razorpay")
+def create_razorpay_test_objects(invoice_id: int, db: Session = Depends(get_db)):
+    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    link = escalation._ensure_payment_link(db, invoice)
     return {
-        "baseline_recovered_inr": round(float(unpaid * 0.38), 2),
-        "model_recovered_inr": round(float(recovered or unpaid * 0.52), 2),
-        "avg_days_to_recovery": 18,
-        "precision": 0.79,
-        "recall": 0.71,
-        "improvement_pct": 23,
+        "status": "success",
+        "invoice_id": invoice.id,
+        "razorpay_invoice_id": invoice.razorpay_invoice_id,
+        "razorpay_payment_link_id": invoice.razorpay_payment_link_id,
+        "payment_link": link.get("short_url"),
+        "mocked": bool(link.get("mocked", False)),
     }
 
 
-@app.post("/api/invoices/{invoice_id}/simulate_reply", response_model=ActionResponse)
+@app.get("/api/results")
+def get_results_summary(db: Session = Depends(get_db)):
+    return run_batch_evaluation(db)
+
+
+@app.post("/api/invoices/{invoice_id}/simulate_reply")
 def simulate_customer_reply(invoice_id: int, payload: ReplyPayload, db: Session = Depends(get_db)):
     invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
     if not invoice:
@@ -322,9 +330,16 @@ def simulate_customer_reply(invoice_id: int, payload: ReplyPayload, db: Session 
             invoice.amount,
         )
         db.expire(invoice, ["promises"])
-        if extracted:
-            return ActionResponse(status="success", message="Promise extracted and logged to ledger.")
-        return ActionResponse(status="success", message="Reply logged, but no concrete commitment found.")
+        extraction = db.query(Ledger).filter(
+            Ledger.invoice_id == invoice_id, Ledger.event_type == "promise_extracted"
+        ).order_by(Ledger.id.desc()).first()
+        raw = (extraction.payload or {}).get("raw", {}) if extraction else {}
+        return {
+            "status": "success", "message": "Promise extracted and logged to ledger." if extracted else "Reply logged, but no concrete commitment found.",
+            "extraction": raw,
+            "needs_review": bool(invoice.needs_review),
+            "promises": [{"id": item.id, "amount": item.amount, "promised_date": item.promised_date.isoformat() if item.promised_date else None, "confidence": item.confidence.value, "status": item.status.value} for item in extracted],
+        }
     except HTTPException:
         db.commit()
         raise
@@ -332,9 +347,28 @@ def simulate_customer_reply(invoice_id: int, payload: ReplyPayload, db: Session 
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.post("/api/simulate/reply", response_model=ActionResponse)
+@app.post("/api/simulate/reply")
 def simulate_reply(payload: SimulateReplyPayload, db: Session = Depends(get_db)):
     return simulate_customer_reply(payload.invoice_id, payload, db)
+
+
+@app.post("/api/invoices/{invoice_id}/sync-payment")
+def sync_invoice_payment(invoice_id: int, payload: PaymentPayload, db: Session = Depends(get_db)):
+    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    amount_paid = payload.amount_paid
+    source = "demo_manual"
+    if amount_paid is None:
+        if invoice.razorpay_payment_link_id:
+            remote = razorpay_client.fetch_payment_link(invoice.razorpay_payment_link_id)
+        else:
+            remote = razorpay_client.check_payment_status(invoice.razorpay_invoice_id)
+        amount_paid = remote.get("amount_paid", 0.0)
+        source = "razorpay_sync"
+    payments.apply_payment(db, invoice, amount_paid, source)
+    reliability.score_customer(invoice.customer_id, db, persist=True)
+    return {"status": "success", "invoice_id": invoice.id, "amount_paid": invoice.amount_paid, "invoice_status": invoice.status.value}
 
 
 @app.post("/api/jobs/run_escalations", response_model=CronRunResponse)
@@ -386,10 +420,12 @@ def get_demo_clock():
 
 
 def _wipe_demo_data(db: Session) -> None:
-    db.query(Ledger).delete(synchronize_session=False)
-    db.query(Promise).delete(synchronize_session=False)
-    db.query(Invoice).delete(synchronize_session=False)
-    db.query(Customer).delete(synchronize_session=False)
+    demo_invoices = select(Invoice.id).where(Invoice.customer_id >= 10000)
+    db.query(Promise).filter(Promise.invoice_id.in_(demo_invoices)).delete(synchronize_session=False)
+    db.query(Ledger).filter(Ledger.invoice_id.in_(demo_invoices)).delete(synchronize_session=False)
+    db.query(CustomerReliability).filter(CustomerReliability.customer_id >= 10000).delete(synchronize_session=False)
+    db.query(Invoice).filter(Invoice.customer_id >= 10000).delete(synchronize_session=False)
+    db.query(Customer).filter(Customer.id >= 10000).delete(synchronize_session=False)
     db.commit()
 
 
@@ -425,6 +461,7 @@ def advance_demo(payload: AdvanceClockPayload):
     db = SessionLocal()
     try:
         invoices = db.query(Invoice).filter(
+            Invoice.customer_id >= 10000,
             Invoice.status.in_([InvoiceStatus.unpaid, InvoiceStatus.partially_paid])
         ).limit(config.MAX_CRON_INVOICES_PER_RUN).all()
         for invoice in invoices:
@@ -436,9 +473,12 @@ def advance_demo(payload: AdvanceClockPayload):
 
 frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.isdir(frontend_dist):
-    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
+    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="frontend-assets")
 
 
-@app.get("/")
-def frontend_index():
+@app.get("/{full_path:path}")
+def frontend_index(full_path: str):
+    index = os.path.join(frontend_dist, "index.html")
+    if os.path.isfile(index):
+        return FileResponse(index)
     return {"message": "CHASR API is running. Build the frontend bundle to serve the UI."}
