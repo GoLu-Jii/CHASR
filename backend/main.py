@@ -1,6 +1,6 @@
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import joblib
 from fastapi import Depends, FastAPI, HTTPException
@@ -138,6 +138,7 @@ def list_invoices(db: Session = Depends(get_db)):
             "id": inv.id,
             "customer_name": inv.customer.name if inv.customer else "Unknown",
             "amount": float(inv.amount),
+            "amount_paid": float(inv.amount_paid or 0),
             "status": inv.status.value,
             "current_stage": (inv.current_stage.value if inv.current_stage else "none"),
             "due_date": inv.due_date.isoformat(),
@@ -145,11 +146,11 @@ def list_invoices(db: Session = Depends(get_db)):
             "needs_review": bool(inv.needs_review),
             "reliability_score": reliability.score_customer(inv.customer_id, db),
             "last_customer_reply": (latest_reply.payload or {}).get("text") if latest_reply else None,
-            "next_action": _next_action(inv),
+            "next_action": _next_action(db, inv),
             "next_message": (
                 (latest_escalation.payload or {}).get("message_sent")
                 if latest_escalation
-                else _next_message(inv)
+                else _next_message(db, inv)
             ),
         })
     return result
@@ -164,14 +165,15 @@ def get_invoice_detail(invoice_id: int, db: Session = Depends(get_db)):
         "id": invoice.id,
         "customer_name": invoice.customer.name if invoice.customer else "Unknown",
         "amount": float(invoice.amount),
+        "amount_paid": float(invoice.amount_paid or 0),
         "status": invoice.status.value,
         "current_stage": invoice.current_stage.value if invoice.current_stage else "none",
         "due_date": invoice.due_date.isoformat(),
         "days_overdue": max(0, (demo_now() - invoice.due_date).days),
         "needs_review": bool(invoice.needs_review),
         "reliability_score": reliability.score_customer(invoice.customer_id, db),
-        "next_action": _next_action(invoice),
-        "next_message": _next_message(invoice),
+        "next_action": _next_action(db, invoice),
+        "next_message": _next_message(db, invoice),
         "razorpay_invoice_id": invoice.razorpay_invoice_id,
         "razorpay_payment_link_id": invoice.razorpay_payment_link_id,
         "promises": [
@@ -188,83 +190,12 @@ def get_invoice_detail(invoice_id: int, db: Session = Depends(get_db)):
     }
 
 
-def _next_action(invoice: Invoice) -> str:
-    if invoice.status in {
-        InvoiceStatus.paid,
-        InvoiceStatus.written_off,
-    }:
-        return "No automated action"
-    if invoice.needs_review or invoice.status == InvoiceStatus.escalation_exhausted:
-        return "Human review required"
-
-    pending_promise = next(
-        (
-            promise
-            for promise in (invoice.promises or [])
-            if promise.status.value == "pending"
-        ),
-        None,
-    )
-    if pending_promise:
-        if pending_promise.amount is not None and pending_promise.promised_date:
-            return "Wait for promised payment date"
-        return "Human review required"
-
-    if any(
-        promise.status.value == "broken"
-        for promise in (invoice.promises or [])
-    ):
-        return "Send formal notice"
-
-    stage = invoice.current_stage.value if invoice.current_stage else "none"
-    if stage == "formal":
-        return "Send formal notice"
-    if stage == "firm":
-        return "Send firm reminder"
-    return "Send friendly nudge"
+def _next_action(db: Session, invoice: Invoice) -> str:
+    return escalation.next_action(db, invoice)["action"]
 
 
-def _next_message(invoice: Invoice) -> str | None:
-    if invoice.status in {
-        InvoiceStatus.paid,
-        InvoiceStatus.written_off,
-    }:
-        return None
-    if invoice.needs_review or invoice.status == InvoiceStatus.escalation_exhausted:
-        return None
-
-    pending_promise = next(
-        (
-            promise
-            for promise in (invoice.promises or [])
-            if promise.status.value == "pending"
-        ),
-        None,
-    )
-    if pending_promise and pending_promise.amount is not None and pending_promise.promised_date:
-        return (
-            "Automation paused until "
-            f"{pending_promise.promised_date.strftime('%d %b %Y')}. "
-            "CHASR will evaluate payment against this promise."
-        )
-
-    if pending_promise:
-        return "Commitment is incomplete. A human must review before contacting the customer."
-
-    stage = invoice.current_stage or "none"
-    if isinstance(stage, str):
-        stage = next(
-            (candidate for candidate in escalation.EscalationStage if candidate.value == stage),
-            escalation.EscalationStage.nudge,
-        )
-
-    return escalation.TEMPLATES[stage].format(
-        name=invoice.customer.name if invoice.customer else "Customer",
-        inv_id=invoice.id,
-        amount=invoice.amount,
-        date=invoice.due_date.strftime("%d %b %Y"),
-        link=f"https://rzp.io/test_{invoice.id}",
-    )
+def _next_message(db: Session, invoice: Invoice) -> str | None:
+    return escalation.next_action(db, invoice)["message"]
 
 
 @app.get("/api/invoices/{invoice_id}/ledger")
@@ -300,14 +231,30 @@ def create_razorpay_test_objects(invoice_id: int, db: Session = Depends(get_db))
     invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    link = escalation._ensure_payment_link(db, invoice)
+    remaining = max(0.0, float(invoice.amount) - float(invoice.amount_paid or 0.0))
+    next_promise = next(
+        (
+            promise for promise in sorted(
+                invoice.promises,
+                key=lambda item: item.promised_date or datetime.max,
+            )
+            if promise.status.value == "pending" and promise.amount
+        ),
+        None,
+    )
+    promised_amount = float(next_promise.amount) if next_promise else 0.0
+    requested_amount = min(remaining, promised_amount) if promised_amount else remaining
+    link = escalation._ensure_payment_link(db, invoice, amount=requested_amount)
+    if link.get("error"):
+        raise HTTPException(status_code=502, detail=f"Razorpay payment-link creation failed: {link['error']}")
     return {
         "status": "success",
         "invoice_id": invoice.id,
         "razorpay_invoice_id": invoice.razorpay_invoice_id,
         "razorpay_payment_link_id": invoice.razorpay_payment_link_id,
         "payment_link": link.get("short_url"),
-        "mocked": bool(link.get("mocked", False)),
+        "amount": requested_amount,
+        "mocked": bool(link.get("mocked", "mock" in str(link.get("id", "")))),
     }
 
 
@@ -359,16 +306,33 @@ def sync_invoice_payment(invoice_id: int, payload: PaymentPayload, db: Session =
         raise HTTPException(status_code=404, detail="Invoice not found")
     amount_paid = payload.amount_paid
     source = "demo_manual"
+    provider_status = "manual"
     if amount_paid is None:
         if invoice.razorpay_payment_link_id:
             remote = razorpay_client.fetch_payment_link(invoice.razorpay_payment_link_id)
         else:
             remote = razorpay_client.check_payment_status(invoice.razorpay_invoice_id)
         amount_paid = remote.get("amount_paid", 0.0)
+        provider_status = remote.get("status", "unknown")
         source = "razorpay_sync"
     payments.apply_payment(db, invoice, amount_paid, source)
     reliability.score_customer(invoice.customer_id, db, persist=True)
-    return {"status": "success", "invoice_id": invoice.id, "amount_paid": invoice.amount_paid, "invoice_status": invoice.status.value}
+    refreshed_status = invoice.status.value
+    message = (
+        f"Razorpay sync complete: {invoice.amount_paid:.2f} received."
+        if invoice.amount_paid > 0
+        else "Razorpay sync complete: no payment has been reported by the provider yet."
+    )
+    return {
+        "status": "success",
+        "message": message,
+        "invoice_id": invoice.id,
+        "amount_paid": invoice.amount_paid,
+        "invoice_status": refreshed_status,
+        "provider_status": provider_status,
+        "next_action": _next_action(db, invoice),
+        "next_message": _next_message(db, invoice),
+    }
 
 
 @app.post("/api/jobs/run_escalations", response_model=CronRunResponse)

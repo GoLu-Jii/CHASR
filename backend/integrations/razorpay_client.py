@@ -68,16 +68,19 @@ def create_invoice(invoice_record: Invoice) -> dict:
         return _mock_response(invoice_record, kind="invoice")
 
 
-def create_payment_link(invoice_record: Invoice) -> dict:
+def create_payment_link(invoice_record: Invoice, amount: float | None = None) -> dict:
     """Create a Razorpay payment link for a B2B invoice, or return a mock URL if not configured."""
+    requested_amount = float(invoice_record.amount if amount is None else amount)
     client = get_client()
     if client is None:
-        return _mock_response(invoice_record, kind="link")
+        response = _mock_response(invoice_record, kind="link")
+        response["amount"] = requested_amount
+        return response
     try:
         payload = {
-            "amount": int(float(invoice_record.amount) * 100),
+            "amount": int(requested_amount * 100),
             "currency": "INR",
-            "description": f"Payment for invoice #{invoice_record.id}",
+            "description": f"Payment for invoice #{invoice_record.id} ({requested_amount:.2f} due now)",
             "customer": {
                 "name": invoice_record.customer.name,
                 "contact": invoice_record.customer.phone,
@@ -91,7 +94,7 @@ def create_payment_link(invoice_record: Invoice) -> dict:
         return client.payment_link.create(data=payload)
     except Exception as exc:  # pragma: no cover
         print(f"Razorpay payment link creation failed: {exc}")
-        return _mock_response(invoice_record, kind="link")
+        return {"error": str(exc), "status": "mocked", "mocked": True, "short_url": ""}
 
 
 def fetch_payment_link(payment_link_id: str) -> dict:

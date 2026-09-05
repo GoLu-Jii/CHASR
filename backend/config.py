@@ -13,7 +13,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./chasr.db")
 
 # §9.3 — kept / partial / broken thresholds
 KEPT_MIN_PCT = 0.95
-KEPT_GRACE_DAYS = 2
+# A stated payment date is a firm operational deadline in the demo and in the
+# scheduler.  Once the virtual day passes it, CHASR evaluates the outcome
+# immediately instead of quietly extending the commitment.
+KEPT_GRACE_DAYS = 0
 PARTIAL_MIN_PCT = 0.30
 PARTIAL_GRACE_DAYS = 7
 
@@ -23,7 +26,10 @@ NUDGE_AFTER_DAYS = 0
 FIRM_AFTER_DAYS = 15
 FORMAL_AFTER_DAYS = 30
 LOW_RELIABILITY_THRESHOLD = 0.40
-HIGH_RELIABILITY_THRESHOLD = 0.75
+# Scores are probability-like model outputs with a small responsiveness
+# calibration.  0.65 reliably separates the demonstrated promise-keepers
+# from neutral accounts while retaining a meaningful middle band.
+HIGH_RELIABILITY_THRESHOLD = 0.65
 LOW_RELIABILITY_FIRM_AFTER_DAYS = 7
 LOW_RELIABILITY_FORMAL_AFTER_DAYS = 21
 HIGH_RELIABILITY_FIRM_AFTER_DAYS = 20
